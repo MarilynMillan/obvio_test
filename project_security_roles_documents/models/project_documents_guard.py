@@ -56,6 +56,33 @@ class DocumentsDocument(models.Model):
                 raise AccessError(_("No puedes eliminar documentos de otros usuarios."))
         return super(DocumentsDocument, self).unlink()
 
+    def read(self, fields=None, load='_classic_read'):
+        res = super(DocumentsDocument, self).read(fields=fields, load=load)
+        if not self._is_project_user_restricted() or self.env.su:
+            return res
+
+        user = self.env.user
+        sensitive_fields = {'datas', 'raw', 'url', 'attachment_id', 'checksum'}
+        fields_to_check = set(fields or []) & sensitive_fields if fields else sensitive_fields
+
+        if fields_to_check and res:
+            record_ids = [r['id'] for r in res if 'id' in r]
+            docs = self.browse(record_ids)
+
+            # Identify which documents the user does not own
+            restricted_doc_ids = {
+                doc.id for doc in docs
+                if doc.owner_id != user and doc.create_uid != user
+            }
+
+            if restricted_doc_ids:
+                for record in res:
+                    if record.get('id') in restricted_doc_ids:
+                        for field in fields_to_check:
+                            if field in record:
+                                record[field] = False
+        return res
+
 
 class MailMessage(models.Model):
     _inherit = "mail.message"
@@ -185,6 +212,45 @@ class IrAttachment(models.Model):
     def unlink(self):
         self._check_documents_attachment_guard(records=self)
         return super().unlink()
+
+    def read(self, fields=None, load='_classic_read'):
+        res = super(IrAttachment, self).read(fields=fields, load=load)
+        if not self._is_project_user_restricted() or self.env.su:
+            return res
+
+        user = self.env.user
+        sensitive_fields = {'datas', 'raw', 'url', 'checksum'}
+        fields_to_check = set(fields or []) & sensitive_fields if fields else sensitive_fields
+
+        if fields_to_check and res:
+            record_ids = [r['id'] for r in res if 'id' in r]
+            attachments = self.browse(record_ids)
+
+            # Filter attachments linked to documents.document
+            doc_linked_attachments = attachments.filtered(lambda a: a.res_model == 'documents.document' and a.res_id)
+
+            if doc_linked_attachments:
+                doc_ids = doc_linked_attachments.mapped('res_id')
+                documents = self.env['documents.document'].sudo().browse(doc_ids).exists()
+
+                # Create a map of doc_id to owner/creator for quick lookup
+                restricted_doc_ids = {
+                    doc.id for doc in documents
+                    if doc.owner_id != user and doc.create_uid != user
+                }
+
+                restricted_attachment_ids = {
+                    att.id for att in doc_linked_attachments
+                    if att.res_id in restricted_doc_ids
+                }
+
+                if restricted_attachment_ids:
+                    for record in res:
+                        if record.get('id') in restricted_attachment_ids:
+                            for field in fields_to_check:
+                                if field in record:
+                                    record[field] = False
+        return res
 
 
 class MailActivity(models.Model):
